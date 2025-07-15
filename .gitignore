@@ -1,0 +1,5 @@
+./sbatch_output_logs/
+./outputs/
+./logs/
+./checkpoints/
+./SWOT-inpainting-DL/
