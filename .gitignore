@@ -3,6 +3,5 @@ outputs/
 logs/
 checkpoints/
 SWOT-inpainting-DL/
-conf/
 .ipynb_checkpoints/
 SWOT-inpainting-DL/
