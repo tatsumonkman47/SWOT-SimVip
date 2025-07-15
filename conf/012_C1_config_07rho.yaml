@@ -1,0 +1,51 @@
+hydra:
+  job:
+    chdir: true
+    name: SimVip
+  run:
+    dir: ./outputs/${hydra:job.name}
+      
+#defaults:
+#  - config_train_base
+
+## Main options
+outdir: "./outputs_SimVip_July_10"   
+
+data:
+  dataset_path: "/home/tm3076/scratch/pytorch_learning_tiles"
+  patch_coords_file: "x_y_coordinates_noland.zarr"
+  infields: ["zarr_llc4320_SSH_tiles_4km_filtered", "zarr_llc4320_SST_tiles_4km"]
+  outfields: ["zarr_llc4320_SSH_tiles_4km_filtered"]
+  in_mask_list: ["nadir", "cloud_rho"]
+  out_mask_list: ["None"]
+  in_transform_list: ["std_global_mean_ssh_norm", "std_global_mean_sst_norm"]
+  out_transform_list: ["std_global_mean_ssh_norm"]
+  mean_ssh: 0
+  std_ssh: 0.0453692672359483
+  mean_sst: 15.956900367755182
+  std_sst: 5.987649544923141
+  N_t: 10
+  timesteps_range: [30, 360, 5] # [start, stop, step]
+  batch_size: 10
+  return_masks: False
+  cloud_rho: 0.7
+
+model:
+  Number_timesteps: 10
+  alpha0: 1
+  alpha1: 10
+  alpha2: 10
+  lr: 1e-3
+  drop: 0.2
+  drop_path: 0.15
+  model_type: "gSTA"
+  multiprocessing: True
+  masked_loss: True
+
+training:
+  model_name: "Simvip_in_nadirSSH_cloudSST_out_swotSSH_loss_gradmasked"
+  num_epochs: 10
+  checkpoint_dir: "checkpoints"
+
+wandb:
+  project: "SimVip_video_inpainting"
