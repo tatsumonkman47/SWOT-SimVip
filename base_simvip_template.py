@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchinfo import summary
 from torch.utils.data import DataLoader, random_split, ConcatDataset
 import numpy as np
 import time
@@ -11,6 +12,7 @@ from tqdm import tqdm
 import zarr
 from omegaconf import OmegaConf
 import wandb
+import argparse
 
 import sys
 from hydra import main, initialize, initialize_config_dir
@@ -18,7 +20,10 @@ from hydra.utils import instantiate
 from pathlib import Path
 
 # Append model path dynamically (could also be in config)
-sys.path.append('/home/tm3076/projects/NYU_SWOT_project/Inpainting_Pytorch_gen/SWOT-inpainting-DL/src')
+if os.path.exists('/home.ufs/tm3076/swot_SUM03/SWOT_project/SWOT-inpainting-DL/src'):
+    sys.path.append('/home.ufs/tm3076/swot_SUM03/SWOT_project/SWOT-inpainting-DL/src')
+else:
+    sys.path.append('/home/tm3076/projects/NYU_SWOT_project/Inpainting_Pytorch_gen/SWOT-inpainting-DL/src')
 import simvip_model
 import data_loaders 
 
@@ -256,7 +261,7 @@ def train_model(
 def run(cfg):
     # Configure
     print(OmegaConf.to_yaml(cfg))
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_cpus = torch.get_num_threads() if torch.cuda.is_available() else 0
     multiprocessing = torch.cuda.is_available()
 
@@ -265,8 +270,16 @@ def run(cfg):
                 "mean_ssh":  cfg.data["mean_ssh"], "std_ssh": cfg.data["std_ssh"],
                 "mean_sst": cfg.data["mean_sst"], "std_sst": cfg.data["std_sst"]
                 }
+    # Load patch coordinates
+    if ".npy" in cfg.data.patch_coords_file:
+        patch_coords = np.load(f"{cfg.data.dataset_path}/{cfg.data.patch_coords_file}")
+    elif ".zarr" in cfg.data.patch_coords_file:
+        patch_coords = zarr.load(f"{cfg.data.dataset_path}/{cfg.data.patch_coords_file}")
+    elif ".nc" in cfg.data.patch_coords_file:
+        patch_coords = zarr.load(f"{cfg.data.dataset_path}/{cfg.data.patch_coords_file}")
+    else:
+        print(f"Wrong datatype detected in {cfg.data.patch_coords_file}, expected one of [.npy, .zarr, .nc]")
     # Load dataset
-    patch_coords = zarr.load(f"{cfg.data.dataset_path}/{cfg.data.patch_coords_file}")
     full_dataset = ConcatDataset([
         data_loaders.llc4320_dataset(
             cfg.data.dataset_path, t, cfg.data.N_t, patch_coords,

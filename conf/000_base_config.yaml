@@ -12,8 +12,8 @@ hydra:
 outdir: "./outputs_SimVip_July_10"   
 
 data:
-  dataset_path: "/home/tm3076/scratch/pytorch_learning_tiles"
-  patch_coords_file: "x_y_coordinates_noland.zarr"
+  dataset_path: "/home.ufs/tm3076/swot_SUM03/pytorch_learning_tiles"
+  patch_coords_file: "zarred_UVSST_x_y_coordinates_noland_nonan.npy"
   infields: ["zarr_llc4320_SSH_tiles_4km_filtered", "zarr_llc4320_SST_tiles_4km"]
   outfields: ["zarr_llc4320_SSH_tiles_4km_filtered"]
   in_mask_list: ["nadir", "cloud_rho"]
@@ -26,7 +26,7 @@ data:
   std_sst: 5.987649544923141
   N_t: 10
   timesteps_range: [30, 360, 5] # [start, stop, step]
-  batch_size: 10
+  batch_size: 45
   return_masks: False
   cloud_rho: 0.5
 
