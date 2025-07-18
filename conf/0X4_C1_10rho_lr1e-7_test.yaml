@@ -1,13 +1,8 @@
-hydra:
-  job:
-    chdir: true
-    name: 0X4_C1_10rho_lr1e
-  run:
-    dir: ./outputs/${hydra:job.name}
+model_variant: 0X4_C1_10rho_lr1e-7_test
 
 wandb:
   project: "SimVip_video_inpainting"
-  model_name: ${hydra.job.name}_${now:%Y-%m-%d}-${now:%H-%M-%S}
+  model_name: ${model_variant}_${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 defaults:
   - 000_base_config_Greene

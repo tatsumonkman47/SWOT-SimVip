@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 #from torchinfo import summary
 from torch.utils.data import DataLoader, random_split, ConcatDataset
+from torch.profiler import profile, record_function, ProfilerActivity
+from torch.cuda.amp import autocast
 import numpy as np
 import time
 import csv
@@ -13,6 +15,7 @@ import zarr
 from omegaconf import OmegaConf
 import wandb
 import argparse
+import xarray as xr
 
 import sys
 from hydra import main, initialize, initialize_config_dir
@@ -27,111 +30,88 @@ else:
 import simvip_model
 import data_loaders 
 
-# Define Sobel gradients as before
-class SobelGradients5D(nn.Module):
-    def __init__(self):
+# Precompute filters once (Sobel + Laplacian)
+class GradientFilters(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        sobel_x = torch.tensor([[-1, 0, 1],
-                                [-2, 0, 2],
-                                [-1, 0, 1]], dtype=torch.float32)
-        sobel_y = torch.tensor([[-1, -2, -1],
-                                [ 0,  0,  0],
-                                [ 1,  2,  1]], dtype=torch.float32)
-        self.register_buffer('weight_x', sobel_x.view(1,1,3,3))
-        self.register_buffer('weight_y', sobel_y.view(1,1,3,3))
-
-    def forward(self, x):
-        B,C,T,H,W = x.shape
-        x_reshaped = x.permute(0,2,1,3,4).reshape(B*T*C,1,H,W)
-        grad_x = F.conv2d(x_reshaped, self.weight_x, padding=1)
-        grad_y = F.conv2d(x_reshaped, self.weight_y, padding=1)
-        grad_x = grad_x.reshape(B,T,C,H,W).permute(0,2,1,3,4)
-        grad_y = grad_y.reshape(B,T,C,H,W).permute(0,2,1,3,4)
-        return grad_x, grad_y
-
+        self.channels = channels
+        sobel_x = torch.tensor([[[-1, 0, 1],
+                                 [-2, 0, 2],
+                                 [-1, 0, 1]]], dtype=torch.float32)
+        sobel_y = torch.tensor([[[-1, -2, -1],
+                                 [ 0,  0,  0],
+                                 [ 1,  2,  1]]], dtype=torch.float32)
+        laplace = torch.tensor([[[0, 1, 0],
+                                 [1, -4, 1],
+                                 [0, 1, 0]]], dtype=torch.float32)
+        self.weight_x = nn.Parameter(sobel_x.expand(channels, 1, 3, 3), requires_grad=False)
+        self.weight_y = nn.Parameter(sobel_y.expand(channels, 1, 3, 3), requires_grad=False)
+        self.weight_lap = nn.Parameter(laplace.expand(channels, 1, 3, 3), requires_grad=False)
+    def compute_first_order(self, x):
+        dx = F.conv2d(x, self.weight_x, padding=1, groups=self.channels)
+        dy = F.conv2d(x, self.weight_y, padding=1, groups=self.channels)
+        return dx, dy
+    def compute_second_order(self, x):
+        lap = F.conv2d(x, self.weight_lap, padding=1, groups=self.channels)
+        return lap
 
 # Compute loss with optional masking and per-data-point normalization
-def compute_loss(model,batch,mode,alpha0,alpha1,alpha2,device,masked_loss=False,):
-    model = model.to(device)
-    mse = lambda a, b: (a - b) ** 2
-    def grad2d(u):
-        dx = u[..., :, 1:] - u[..., :, :-1]
-        dy = u[..., 1:, :] - u[..., :-1, :]
-        return dx, dy
-    def grad2d_second(u):
-        dxx = u[..., :, 2:] - 2 * u[..., :, 1:-1] + u[..., :, :-2]
-        dyy = u[..., 2:, :] - 2 * u[..., 1:-1, :] + u[..., :-2, :]
-        return dxx, dyy
-    if mode == 'train':
-        model.train()
-    else:
-        model.eval()
-        
-    if len(batch) == 2:
-        x, y = batch
-    else:
-        x, y, _ = batch
-    x = x.to(device).float()
-    y = y.to(device).float()
+def compute_loss(model,x,y,mode,alpha0,alpha1,alpha2,filters,masked_loss=False,):
+    model.train() if mode == 'train' else model.eval()
+    B, C, T, H, W = y.shape
     y_hat = model(x)
-    
+    # Flatten time: (B, T, C, H, W) → (B*T, C, H, W)
+    y2d = y.reshape(B*T, C, H, W)
+    yhat2d = y_hat.reshape(B*T, C, H, W)
     if masked_loss:
-        # mask == 1 where y is not zero
-        mask = (y != 0).float()
-        # Main loss only over unmasked elements
-        per_element_loss = mse(y, y_hat) * mask
-        loss = per_element_loss.sum() / mask.sum().clamp_min(1.0)
-        # Gradients: mask central pixels to avoid border artifacts
-        central_mask_x = (mask[..., :, 1:] * mask[..., :, :-1])
-        central_mask_y = (mask[..., 1:, :] * mask[..., :-1, :])
-        dx_y, dy_y = grad2d(y)
-        dx_yh, dy_yh = grad2d(y_hat)
-        grad_loss_x = mse(dx_y, dx_yh) * central_mask_x
-        grad_loss_y = mse(dy_y, dy_yh) * central_mask_y
-        loss_grad = (
-            grad_loss_x.sum() / central_mask_x.sum().clamp_min(1.0)
-            + grad_loss_y.sum() / central_mask_y.sum().clamp_min(1.0)
-        )
-        # Second gradients: mask central pixels
-        central_mask_xx = (mask[..., :, 2:] * mask[..., :, 1:-1] * mask[..., :, :-2])
-        central_mask_yy = (mask[..., 2:, :] * mask[..., 1:-1, :] * mask[..., :-2, :])
-        dxx_y, dyy_y = grad2d_second(y)
-        dxx_yh, dyy_yh = grad2d_second(y_hat)
-        grad2_loss_x = mse(dxx_y, dxx_yh) * central_mask_xx
-        grad2_loss_y = mse(dyy_y, dyy_yh) * central_mask_yy
-        loss_grad2 = (
-            grad2_loss_x.sum() / central_mask_xx.sum().clamp_min(1.0)
-            + grad2_loss_y.sum() / central_mask_yy.sum().clamp_min(1.0)
-        )
+        mask2d = (y2d != 0).float()
     else:
-        # Unmasked case: treat all pixels as valid
-        valid_count = torch.numel(y)
-        per_element_loss = mse(y, y_hat)
-        loss = per_element_loss.sum() / valid_count
-        dx_y, dy_y = grad2d(y)
-        dx_yh, dy_yh = grad2d(y_hat)
-        grad_loss_x = mse(dx_y, dx_yh)
-        grad_loss_y = mse(dy_y, dy_yh)
+        mask2d = None
+    
+    # ==== MSE loss ====
+    if masked_loss:
+        mse_raw = (y2d - yhat2d) ** 2
+        mse_loss = (mse_raw * mask2d).sum() / mask2d.sum().clamp_min(1.0)
+    else:
+        mse_loss = F.mse_loss(y2d, yhat2d)
+        
+    # ==== First-order gradients ====
+    dx_y, dy_y = filters.compute_first_order(y2d)
+    dx_yhat, dy_yhat = filters.compute_first_order(yhat2d)
+    grad_x_loss = (dx_y - dx_yhat).pow(2)
+    grad_y_loss = (dy_y - dy_yhat).pow(2)
+    if masked_loss:
+        # Mask center pixels (e.g., pad=1 conv ⇒ shrink mask by 1)
+        central_mask_x = mask2d[:, :, :, :, 1:] * mask2d[:, :, :, :, :-1]
+        central_mask_y = mask2d[:, :, :, 1:, :] * mask2d[:, :, :, :-1, :]
+        central_mask_x = central_mask_x.reshape(B*T, C, H, W - 1)
+        central_mask_y = central_mask_y.reshape(B*T, C, H - 1, W)
+        grad_x_loss = (grad_x_loss[:, :, :, :, 1:] * central_mask_x).sum() / central_mask_x.sum().clamp_min(1.0)
+        grad_y_loss = (grad_y_loss[:, :, :, 1:, :] * central_mask_y).sum() / central_mask_y.sum().clamp_min(1.0)
+    else:
+        grad_x_loss = grad_x_loss.mean()
+        grad_y_loss = grad_y_loss.mean()
+    grad_loss = grad_x_loss + grad_y_loss
 
-        # For gradients, the counts are smaller because of the shifts:
-        count_dx = dx_y.numel()
-        count_dy = dy_y.numel()
-        loss_grad = (
-            grad_loss_x.sum() / count_dx
-            + grad_loss_y.sum() / count_dy
+    # ==== Second-order: Laplacian ====
+    lap_y = filters.compute_second_order(y2d)
+    lap_yhat = filters.compute_second_order(yhat2d)
+    lap_loss = (lap_y - lap_yhat).pow(2)
+    if masked_loss:
+        # Center 3-frame mask
+        central_mask = (
+            mask2d[:, :, :, 1:-1, 1:-1]
+            * mask2d[:, :, :, :-2, 1:-1]
+            * mask2d[:, :, :, 2:, 1:-1]
+            * mask2d[:, :, :, 1:-1, :-2]
+            * mask2d[:, :, :, 1:-1, 2:]
         )
-        dxx_y, dyy_y = grad2d_second(y)
-        dxx_yh, dyy_yh = grad2d_second(y_hat)
-        count_dxx = dxx_y.numel()
-        count_dyy = dyy_y.numel()
-        grad2_loss_x = mse(dxx_y, dxx_yh)
-        grad2_loss_y = mse(dyy_y, dyy_yh)
-        loss_grad2 = (
-            grad2_loss_x.sum() / count_dxx
-            + grad2_loss_y.sum() / count_dyy
-        )
+        central_mask = central_mask.reshape(B*T, C, H - 2, W - 2)
+        lap_loss = (lap_loss[:, :, 1:-1, 1:-1] * central_mask).sum() / central_mask.sum().clamp_min(1.0)
+    else:
+        lap_loss = lap_loss.mean()
 
-    total_loss = alpha0 * loss + alpha1 * loss_grad + alpha2 * loss_grad2
+    total_loss = alpha0 * mse_loss + alpha1 * grad_loss + alpha2 * lap_loss
     return total_loss
     
 
@@ -152,10 +132,10 @@ def train_model(
     wandb_config=None,
     hydra_cfg=None
 ):
-    import wandb
-    torch.set_num_threads(1)
+
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.enable_flash_sdp(True)
+    scaler = torch.cuda.amp.GradScaler()
 
     os.makedirs("logs", exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -184,7 +164,7 @@ def train_model(
     if wandb_config:
         wandb.init(
             project=wandb_config["project"],
-            name=wandb_config.get("run_name", model_name),
+            name=wandb_config.get("model_name", model_name),
             config={
                 "lr": lr,
                 "num_epochs": num_epochs,
@@ -197,67 +177,90 @@ def train_model(
         if hydra_cfg:
             wandb.config.update(OmegaConf.to_container(hydra_cfg, resolve=True), allow_val_change=True)
 
+    # Get output tensor shape
+    x, y = next(iter(train_loader))
+    C = y.shape[-3]
+    filters = GradientFilters(C).to(device)
+    
     log_path = f"logs/{model_name}_log.csv"
     if not os.path.exists(log_path):
         with open(log_path, 'w', newline='') as f:
             csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "epoch_time_sec"])
 
+    ################################################################
+    # Profiler
+    if hydra_cfg.training.get("enable_profiler", False):
+        print("Running dry-run for profiling...")
+        x, y = next(iter(train_loader))
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        filters = GradientFilters(y.shape[-3]).to(device)
+    
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            with_stack=True,
+            profile_memory=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("profiler_logs/dryrun")
+        ) as prof:
+            for _ in range(5):  # small warmup loop
+                with autocast(), record_function("warmup_step"):
+                    loss = compute_loss(model, x, y, 'train', alpha0, alpha1, alpha2, filters, masked_loss)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                prof.step()
+    print(f"Dry-run complete. GPU mem: {torch.cuda.memory_reserved(device)/1e9:.2f} GB")
+    ################################################################
+    
     for epoch in range(num_epochs):
         model.train()
         train_losses = []
         start_time = time.time()
-
         for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1} Training", leave=False)):
+            x, y = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
+            # Failsafe for changing channels on input..
+            if filters.channels != y.shape[-3]:
+                filters = GradientFilters(y.shape[-3]).to(device)
             optimizer.zero_grad()
-            loss = compute_loss(model, batch, 'train', alpha0, alpha1, alpha2, device, masked_loss)
-            loss.backward()
-            optimizer.step()
+            # Profile the first 10 steps
+            with autocast():
+                loss = compute_loss(model, x, y, 'train', alpha0, alpha1, alpha2, filters, masked_loss)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             train_losses.append(loss.item())
             if wandb_config:
-                gpu_mem_allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
-                gpu_mem_max = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
                 wandb.log({
                     "train/step_loss": loss.item(),
-                    "train/gpu_memory_gb": gpu_mem_allocated,
-                    "train/gpu_memory_max_gb": gpu_mem_max,
-                    "epoch": epoch + 1,
-                    "global_step": global_step,
-                    "learning_rate": scheduler.optimizer.param_groups[0]["lr"],
+                    "gpu_mem_allocated": torch.cuda.memory_allocated(device) / (1024**3),
+                    "global_step": global_step
                 })
             global_step += 1
-            # ✅ Save best model every 50 steps
-            if global_step % 50 == 0:
-                val_losses_step = []
-                model.eval()
-                with torch.no_grad():
-                    for batch in val_loader:
-                        val_loss_step = compute_loss(
-                            model, batch, 'val', alpha0, alpha1, alpha2, device, masked_loss
-                        )
-                        val_losses_step.append(val_loss_step.item())
-                val_loss_step_avg = np.mean(val_losses_step)
-                if val_loss_step_avg < best_val_loss:
-                    best_val_loss = val_loss_step_avg
-                    torch.save(
-                        model.state_dict(),
-                        os.path.join(checkpoint_dir, f"{model_name}_best.pt")
-                    )
-                    print(f"💾 Best model updated @ step {global_step} (Val Loss: {best_val_loss:.4f})")
-
         train_loss = np.mean(train_losses)
-        # Epoch-level validation
-        model.eval()
+        
+        # Validation
         val_losses = []
+        model.eval()
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating", leave=False):
-                val_loss = compute_loss(
-                    model, batch, 'val', alpha0, alpha1, alpha2, device, masked_loss
-                )
+            for batch in val_loader:
+                x, y = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
+                val_loss = compute_loss(model, x, y, 'val', alpha0, alpha1, alpha2, filters, masked_loss)
                 val_losses.append(val_loss.item())
         val_loss = np.mean(val_losses)
         scheduler.step(val_loss)
         epoch_time = time.time() - start_time
         print(f"[{epoch+1}] Train: {train_loss:.4f}  Val: {val_loss:.4f}")
+        with open(log_path, 'a', newline='') as f:
+            csv.writer(f).writerow([epoch + 1, f"{train_loss:.6f}", f"{val_loss:.6f}", round(epoch_time, 2)])
+        if not np.isfinite(val_loss):
+            print("Skipping save due to non-finite val_loss.")
+            continue
+        # Save best model after every batch
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), os.path.join(checkpoint_dir, f"{model_name}_best.pt"))
+            print(f"Best model updated @ step {global_step} (Val Loss: {best_val_loss:.4f})")
         # Save checkpoint every epoch
         checkpoint_data = {
             "epoch": epoch,
@@ -268,15 +271,6 @@ def train_model(
         }
         ckpt_filename = f"{model_name}_checkpoint_{epoch+1}.pt"
         torch.save(checkpoint_data, os.path.join(checkpoint_dir, ckpt_filename))
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(
-                model.state_dict(),
-                os.path.join(checkpoint_dir, f"{model_name}_best.pt")
-            )
-            print(f"Best model updated (Val Loss: {best_val_loss:.4f})")
-        with open(log_path, 'a', newline='') as f:
-            csv.writer(f).writerow([epoch + 1, train_loss, val_loss, round(epoch_time, 2)])
         if wandb_config:
             wandb.log({
                 "epoch": epoch + 1,
@@ -289,9 +283,8 @@ def train_model(
     test_losses = []
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing"):
-            test_loss = compute_loss(
-                model, batch, 'test', alpha0, alpha1, alpha2, device, masked_loss
-            )
+            x, y = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
+            test_loss = compute_loss(model, x, y, 'val', alpha0, alpha1, alpha2, filters, masked_loss)
             test_losses.append(test_loss.item())
     test_loss = np.mean(test_losses)
     print(f"Test Loss: {test_loss:.4f}")
@@ -304,6 +297,11 @@ def train_model(
 # Main entry point
 @main(config_path="conf", config_name="config")
 def run(cfg):
+    # Save config used in the run directory
+    os.makedirs(".", exist_ok=True)
+    OmegaConf.save(cfg, "config_used.yaml")
+    print(f"Config saved at: {os.getcwd()}/config_used.yaml")
+
     # Configure
     print(OmegaConf.to_yaml(cfg))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -312,7 +310,7 @@ def run(cfg):
     print(f"Using device: {device}")
     print(f"Using n_cpus: {n_cpus}")
     print(f"Multiprocessing: {multiprocessing}")
-    print(f"Training model: {cfg.hydra.job["name"]}")
+    print(f"Training model: {cfg['model_variant']}")
     
     # Prepare standards for transforms
     standards = {
@@ -325,7 +323,7 @@ def run(cfg):
     elif ".zarr" in cfg.data.patch_coords_file:
         patch_coords = zarr.load(f"{cfg.data.dataset_path}/{cfg.data.patch_coords_file}")
     elif ".nc" in cfg.data.patch_coords_file:
-        patch_coords = zarr.load(f"{cfg.data.dataset_path}/{cfg.data.patch_coords_file}")
+        patch_coords = xr.open_dataarray(f"{cfg.data.dataset_path}/{cfg.data.patch_coords_file}")
     else:
         print(f"Wrong datatype detected in {cfg.data.patch_coords_file}, expected one of [.npy, .zarr, .nc]")
     # Load dataset
@@ -348,21 +346,22 @@ def run(cfg):
     # Instatiate data loaders
     def worker_init_fn(worker_id):
         _ = torch.utils.data.get_worker_info()
-    train_loader = DataLoader(train_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=cfg.data.batch_size, shuffle=False, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing, pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",False), pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",False), pin_memory=True)
+    test_loader = DataLoader(test_set, batch_size=cfg.data.batch_size, shuffle=False, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",False), pin_memory=True)
     
     # Instantiate model
     in_shape = (cfg.model.Number_timesteps, len(cfg.data.infields), 128, 128)
     base_model = simvip_model.SimVP_Model_no_skip_sst(in_shape=in_shape, **cfg.model)
-    base_model = base_model.to(device) # Put model on GPU
+    base_model = torch.compile(base_model, mode="default")
+    base_model = base_model.to(device, non_blocking=True) # Put model on GPU
     print("Model is on device:", next(base_model.parameters()).device) # Verify
     
     # Train model
     train_model(
         model=base_model,
         device=device,
-        model_name=cfg.hyrda.job.name,
+        model_name=cfg["model_variant"],
         train_loader=train_loader,
         val_loader=val_loader,
         test_loader=test_loader,
@@ -373,7 +372,7 @@ def run(cfg):
         alpha2=cfg.model.alpha2,
         masked_loss=cfg.model.masked_loss,
         wandb_config=cfg.wandb,
-        hydra_cfg=cfg  # 👈 Log the entire config to wandb
+        hydra_cfg=cfg  # Log the entire config to wandb
     )
     
 if __name__ == "__main__":

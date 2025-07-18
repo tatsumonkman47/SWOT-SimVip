@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=20            # Increased from 4
-#SBATCH --time=12:00:00               # Reduced from 24h if possible
-#SBATCH --mem=64GB                    # Increased from 32GB
+#SBATCH --cpus-per-task=15            # Increased from 4
+#SBATCH --time=24:00:00               # Reduced from 24h if possible
+#SBATCH --mem=80GB                    # Increased from 32GB
 #SBATCH --gres=gpu:1                  # Consider adding GPU type
 #SBATCH --constraint=a100|rtx8000     # Specific GPU type if available
 #SBATCH --gres-flags=enforce-binding  # Exclusive GPU access

@@ -1,15 +1,24 @@
-hydra:
-  job:
-    chdir: true
-    name: SimVip_base
-  run:
-    dir: ./outputs/${hydra:job.name}/${now:%Y-%m-%d}-${now:%H-%M-%S}
-      
-#defaults:
-#  - config_train_base
+# config.yaml
+defaults:
+  - _self_
+  - override hydra/job_logging: disabled  # optional
+  - override hydra/hydra_logging: disabled  # optional
 
 ## Main options
-outdir: "./outputs_SimVip_July_10"   
+outdir: "./outputs_SimVip_July"   
+
+# Main Model Config 
+overall_model: SimVip_base
+model_variant: SimVip_base
+
+# Hydra config 
+hydra:
+  run:
+    dir: outputs/${overall_model}/${model_variant}/${now:%Y-%m-%d_%H-%M-%S}
+  output_subdir: null
+  job:
+    chdir: true  # optional: changes working directory to hydra.run.dir      
+
 
 data:
   dataset_path: "/home/tm3076/scratch/pytorch_learning_tiles"
@@ -25,7 +34,7 @@ data:
   mean_sst: 15.956900367755182
   std_sst: 5.987649544923141
   N_t: 10
-  timesteps_range: [30, 360, 5] # [start, stop, step]
+  timesteps_range: [20, 360, 2] # [start, stop, step]
   batch_size: 64
   return_masks: False
   cloud_rho: 0.5
@@ -45,6 +54,8 @@ model:
 training:
   num_epochs: 100
   checkpoint_dir: "checkpoints"
+  workers: 8
+  enable_profiler: False
 
 wandb:
   model_name: ${hydra.job.name}_${now:%Y-%m-%d}-${now:%H-%M-%S}
