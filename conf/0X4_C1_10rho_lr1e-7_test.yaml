@@ -1,0 +1,23 @@
+hydra:
+  job:
+    chdir: true
+    name: 0X4_C1_10rho_lr1e
+  run:
+    dir: ./outputs/${hydra:job.name}
+
+wandb:
+  project: "SimVip_video_inpainting"
+  model_name: ${hydra.job.name}_${now:%Y-%m-%d}-${now:%H-%M-%S}
+
+defaults:
+  - 000_base_config_Greene
+
+data:
+  patch_coords_file: "zarred_UVSST_x_y_coordinates_noland_nonan.npy"
+  infields: ["zarr_llc4320_SSH_tiles_4km_filtered", "zarr_llc4320_SST_tiles_4km"]
+  outfields: ["zarr_llc4320_SSH_tiles_4km_filtered"]
+  in_mask_list: ["nadir", "None"]
+  out_mask_list: ["None"]
+
+model:
+  lr: 1e-7

@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchinfo import summary
+#from torchinfo import summary
 from torch.utils.data import DataLoader, random_split, ConcatDataset
 import numpy as np
 import time
@@ -52,6 +52,7 @@ class SobelGradients5D(nn.Module):
 
 # Compute loss with optional masking and per-data-point normalization
 def compute_loss(model,batch,mode,alpha0,alpha1,alpha2,device,masked_loss=False,):
+    model = model.to(device)
     mse = lambda a, b: (a - b) ** 2
     def grad2d(u):
         dx = u[..., :, 1:] - u[..., :, :-1]
@@ -134,7 +135,6 @@ def compute_loss(model,batch,mode,alpha0,alpha1,alpha2,device,masked_loss=False,
     return total_loss
     
 
-# Training loop
 def train_model(
     model,
     device,
@@ -149,17 +149,38 @@ def train_model(
     alpha2,
     masked_loss,
     checkpoint_dir="checkpoints",
-    wandb_config=None
+    wandb_config=None,
+    hydra_cfg=None
 ):
     import wandb
+    torch.set_num_threads(1)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.enable_flash_sdp(True)
 
-    # Create directories
     os.makedirs("logs", exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100,500], gamma=0.1)
 
-    # Initialize wandb
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+
+    best_val_loss = float("inf")
+    start_epoch = 0
+    global_step = 0
+
+    # Try to load previous checkpoint
+    best_ckpt_path = os.path.join(checkpoint_dir, f"{model_name}_best.pt")
+    if os.path.exists(best_ckpt_path):
+        print(f"Found existing checkpoint. Loading: {best_ckpt_path}")
+        checkpoint_files = sorted([f for f in os.listdir(checkpoint_dir) if f.startswith(f"{model_name}_checkpoint_") and f.endswith(".pt")])
+        if checkpoint_files:
+            latest_ckpt = os.path.join(checkpoint_dir, checkpoint_files[-1])
+            checkpoint = torch.load(latest_ckpt, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
+            start_epoch = checkpoint.get("epoch", 0) + 1
+            print(f"Resuming training from epoch {start_epoch}")
     if wandb_config:
         wandb.init(
             project=wandb_config["project"],
@@ -173,45 +194,68 @@ def train_model(
             }
         )
         wandb.run.log_code(".")
-        
+        if hydra_cfg:
+            wandb.config.update(OmegaConf.to_container(hydra_cfg, resolve=True), allow_val_change=True)
+
     log_path = f"logs/{model_name}_log.csv"
     if not os.path.exists(log_path):
-        with open(log_path,'w',newline='') as f:
-            csv.writer(f).writerow(["epoch","train_loss","val_loss","epoch_time_sec"])
-    best_val_loss = float("inf")
-    global_step = 0
+        with open(log_path, 'w', newline='') as f:
+            csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "epoch_time_sec"])
+
     for epoch in range(num_epochs):
         model.train()
         train_losses = []
         start_time = time.time()
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1} Training", leave=False)):
-            batch = batch
+
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1} Training", leave=False)):
             optimizer.zero_grad()
             loss = compute_loss(model, batch, 'train', alpha0, alpha1, alpha2, device, masked_loss)
             loss.backward()
             optimizer.step()
             train_losses.append(loss.item())
-            # Wandb log per batch
-            if global_step % 10 == 0:
-                if wandb_config:
-                    wandb.log({
-                        "train/batch_loss": loss.item(),
-                        "epoch": epoch + 1,
-                        "global_step": global_step,
-                        "learning_rate": scheduler.get_last_lr()[0],
-                    })
+            if wandb_config:
+                gpu_mem_allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                gpu_mem_max = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                wandb.log({
+                    "train/step_loss": loss.item(),
+                    "train/gpu_memory_gb": gpu_mem_allocated,
+                    "train/gpu_memory_max_gb": gpu_mem_max,
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "learning_rate": scheduler.optimizer.param_groups[0]["lr"],
+                })
             global_step += 1
+            # ✅ Save best model every 50 steps
+            if global_step % 50 == 0:
+                val_losses_step = []
+                model.eval()
+                with torch.no_grad():
+                    for batch in val_loader:
+                        val_loss_step = compute_loss(
+                            model, batch, 'val', alpha0, alpha1, alpha2, device, masked_loss
+                        )
+                        val_losses_step.append(val_loss_step.item())
+                val_loss_step_avg = np.mean(val_losses_step)
+                if val_loss_step_avg < best_val_loss:
+                    best_val_loss = val_loss_step_avg
+                    torch.save(
+                        model.state_dict(),
+                        os.path.join(checkpoint_dir, f"{model_name}_best.pt")
+                    )
+                    print(f"💾 Best model updated @ step {global_step} (Val Loss: {best_val_loss:.4f})")
 
-        scheduler.step()
         train_loss = np.mean(train_losses)
-        # Validation
+        # Epoch-level validation
         model.eval()
         val_losses = []
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating", leave=False):
-                val_loss = compute_loss(model, batch, 'val', alpha0, alpha1, alpha2, device, masked_loss)
+                val_loss = compute_loss(
+                    model, batch, 'val', alpha0, alpha1, alpha2, device, masked_loss
+                )
                 val_losses.append(val_loss.item())
         val_loss = np.mean(val_losses)
+        scheduler.step(val_loss)
         epoch_time = time.time() - start_time
         print(f"[{epoch+1}] Train: {train_loss:.4f}  Val: {val_loss:.4f}")
         # Save checkpoint every epoch
@@ -224,18 +268,18 @@ def train_model(
         }
         ckpt_filename = f"{model_name}_checkpoint_{epoch+1}.pt"
         torch.save(checkpoint_data, os.path.join(checkpoint_dir, ckpt_filename))
-        # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), os.path.join(checkpoint_dir, f"{model_name}_best.pt"))
-            print(f"✅ Best model updated (Val Loss: {best_val_loss:.4f})")
-        # Append CSV log
-        with open(log_path,'a',newline='') as f:
-            csv.writer(f).writerow([epoch+1, train_loss, val_loss, round(epoch_time,2)])
-        # Wandb log summary stats per epoch
+            torch.save(
+                model.state_dict(),
+                os.path.join(checkpoint_dir, f"{model_name}_best.pt")
+            )
+            print(f"Best model updated (Val Loss: {best_val_loss:.4f})")
+        with open(log_path, 'a', newline='') as f:
+            csv.writer(f).writerow([epoch + 1, train_loss, val_loss, round(epoch_time, 2)])
         if wandb_config:
             wandb.log({
-                "epoch": epoch+1,
+                "epoch": epoch + 1,
                 "train/epoch_loss": train_loss,
                 "val/epoch_loss": val_loss,
                 "epoch_time_sec": epoch_time,
@@ -245,11 +289,12 @@ def train_model(
     test_losses = []
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing"):
-            test_loss = compute_loss(model, batch, 'test', alpha0, alpha1, alpha2, device, masked_loss)
+            test_loss = compute_loss(
+                model, batch, 'test', alpha0, alpha1, alpha2, device, masked_loss
+            )
             test_losses.append(test_loss.item())
     test_loss = np.mean(test_losses)
     print(f"Test Loss: {test_loss:.4f}")
-
     if wandb_config:
         wandb.log({"test_loss": test_loss})
         wandb.finish()
@@ -264,7 +309,11 @@ def run(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_cpus = torch.get_num_threads() if torch.cuda.is_available() else 0
     multiprocessing = torch.cuda.is_available()
-
+    print(f"Using device: {device}")
+    print(f"Using n_cpus: {n_cpus}")
+    print(f"Multiprocessing: {multiprocessing}")
+    print(f"Training model: {cfg.hydra.job["name"]}")
+    
     # Prepare standards for transforms
     standards = {
                 "mean_ssh":  cfg.data["mean_ssh"], "std_ssh": cfg.data["std_ssh"],
@@ -286,29 +335,34 @@ def run(cfg):
             cfg.data.infields, cfg.data.outfields, cfg.data.in_mask_list, cfg.data.out_mask_list,
             cfg.data.in_transform_list, cfg.data.out_transform_list, standards=standards,
             multiprocessing=multiprocessing, return_masks=cfg.data.return_masks
-        ) for t in cfg.data.timesteps_range
+        ) for t in np.arange(cfg.data.timesteps_range[0],cfg.data.timesteps_range[1],cfg.data.timesteps_range[2],)
     ])
     train_len = int(0.7 * len(full_dataset))
     val_len = int(0.2 * len(full_dataset))
     test_len = len(full_dataset) - train_len - val_len
+    print(f"Training dataset length: {train_len}")
+    print(f"Validation dataset length: {val_len}")
+    print(f"Test dataset length: {test_len}")
     train_set, val_set, test_set = random_split(full_dataset, [train_len, val_len, test_len])
-    
+
     # Instatiate data loaders
     def worker_init_fn(worker_id):
         _ = torch.utils.data.get_worker_info()
-    train_loader = DataLoader(train_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing)
-    val_loader = DataLoader(val_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing)
-    test_loader = DataLoader(test_set, batch_size=cfg.data.batch_size, shuffle=False, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing)
+    train_loader = DataLoader(train_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing, pin_memory=True)
+    test_loader = DataLoader(test_set, batch_size=cfg.data.batch_size, shuffle=False, num_workers=n_cpus, worker_init_fn=worker_init_fn, persistent_workers=multiprocessing, pin_memory=True)
     
     # Instantiate model
     in_shape = (cfg.model.Number_timesteps, len(cfg.data.infields), 128, 128)
     base_model = simvip_model.SimVP_Model_no_skip_sst(in_shape=in_shape, **cfg.model)
+    base_model = base_model.to(device) # Put model on GPU
+    print("Model is on device:", next(base_model.parameters()).device) # Verify
     
     # Train model
     train_model(
         model=base_model,
         device=device,
-        model_name=cfg.training.model_name,
+        model_name=cfg.hyrda.job.name,
         train_loader=train_loader,
         val_loader=val_loader,
         test_loader=test_loader,
@@ -318,8 +372,9 @@ def run(cfg):
         alpha1=cfg.model.alpha1,
         alpha2=cfg.model.alpha2,
         masked_loss=cfg.model.masked_loss,
-        wandb_config=cfg.wandb
+        wandb_config=cfg.wandb,
+        hydra_cfg=cfg  # 👈 Log the entire config to wandb
     )
-
+    
 if __name__ == "__main__":
     run()

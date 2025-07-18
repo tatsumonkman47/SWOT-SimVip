@@ -26,7 +26,7 @@ data:
   std_sst: 5.987649544923141
   N_t: 10
   timesteps_range: [30, 360, 5] # [start, stop, step]
-  batch_size: 45
+  batch_size: 50
   return_masks: False
   cloud_rho: 0.5
 
@@ -35,7 +35,7 @@ model:
   alpha0: 1
   alpha1: 10
   alpha2: 10
-  lr: 1e-3
+  lr: 1e-4
   drop: 0.2
   drop_path: 0.15
   model_type: "gSTA"
@@ -44,7 +44,7 @@ model:
 
 training:
   model_name: "Simvip_in_nadirSSH_cloudSST_out_swotSSH_loss_gradmasked"
-  num_epochs: 10
+  num_epochs: 20
   checkpoint_dir: "checkpoints"
 
 wandb:

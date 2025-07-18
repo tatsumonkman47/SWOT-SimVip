@@ -106,7 +106,7 @@ def save_model_summary(
         )
     else:
         extra_str += (
-            "⚠️ Could not estimate GPU memory automatically. Provide gpu_mem_gb argument to enable estimation.\n"
+            "Could not estimate GPU memory automatically. Provide gpu_mem_gb argument to enable estimation.\n"
         )
 
     # Write output
@@ -184,7 +184,7 @@ def dry_run():
     # Forward pass
     with torch.no_grad():
         y_hat = model(x.float())
-    print(f"🎯 Forward pass successful. Output shape: {y_hat.shape}")
+    print(f"Forward pass successful. Output shape: {y_hat.shape}")
 
     # Simple assertion check
     assert y.shape == y_hat.shape, "Output shape mismatch!"
