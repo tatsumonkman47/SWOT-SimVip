@@ -32,21 +32,15 @@ import data_loaders
 
 # Precompute filters once (Sobel + Laplacian)
 class GradientFilters(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, device, dtype):
         super().__init__()
         self.channels = channels
-        sobel_x = torch.tensor([[[-1, 0, 1],
-                                 [-2, 0, 2],
-                                 [-1, 0, 1]]], dtype=torch.float32)
-        sobel_y = torch.tensor([[[-1, -2, -1],
-                                 [ 0,  0,  0],
-                                 [ 1,  2,  1]]], dtype=torch.float32)
-        laplace = torch.tensor([[[0, 1, 0],
-                                 [1, -4, 1],
-                                 [0, 1, 0]]], dtype=torch.float32)
-        self.weight_x = nn.Parameter(sobel_x.expand(channels, 1, 3, 3), requires_grad=False)
-        self.weight_y = nn.Parameter(sobel_y.expand(channels, 1, 3, 3), requires_grad=False)
-        self.weight_lap = nn.Parameter(laplace.expand(channels, 1, 3, 3), requires_grad=False)
+        self.register_buffer("weight_x", self.make_kernel([[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]], channels, device, dtype))
+        self.register_buffer("weight_y", self.make_kernel([[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]], channels, device, dtype))
+        self.register_buffer("weight_lap", self.make_kernel([[[0, 1, 0], [1, -4, 1], [0, 1, 0]]], channels, device, dtype))
+    def make_kernel(self, kernel_2d, channels, device, dtype):
+        kernel = torch.tensor(kernel_2d, dtype=dtype, device=device)
+        return kernel.expand(channels, 1, 3, 3).contiguous()
     def compute_first_order(self, x):
         dx = F.conv2d(x, self.weight_x, padding=1, groups=self.channels)
         dy = F.conv2d(x, self.weight_y, padding=1, groups=self.channels)
@@ -58,13 +52,20 @@ class GradientFilters(nn.Module):
 # Compute loss with optional masking and per-data-point normalization
 def compute_loss(model,x,y,mode,alpha0,alpha1,alpha2,filters,masked_loss=False,):
     model.train() if mode == 'train' else model.eval()
-    B, C, T, H, W = y.shape
+    # Get model's dtype and device
+    dtype = next(model.parameters()).dtype
+    device = next(model.parameters()).device
+    # Move and cast x, y accordingly
+    x = x.to(device=device, dtype=dtype)
+    y = y.to(device=device, dtype=dtype)
+    B, T, C, H, W = y.shape
     y_hat = model(x)
-    # Flatten time: (B, T, C, H, W) → (B*T, C, H, W)
+    # Reshape for 2D filtering: [B*T, C, H, W]
+    # This is because GradientFilters (which uses F.conv2d) expects input.shape == [N, C, H, W]
     y2d = y.reshape(B*T, C, H, W)
     yhat2d = y_hat.reshape(B*T, C, H, W)
     if masked_loss:
-        mask2d = (y2d != 0).float()
+        mask2d = (y2d != 0)
     else:
         mask2d = None
     
@@ -82,12 +83,12 @@ def compute_loss(model,x,y,mode,alpha0,alpha1,alpha2,filters,masked_loss=False,)
     grad_y_loss = (dy_y - dy_yhat).pow(2)
     if masked_loss:
         # Mask center pixels (e.g., pad=1 conv ⇒ shrink mask by 1)
-        central_mask_x = mask2d[:, :, :, :, 1:] * mask2d[:, :, :, :, :-1]
-        central_mask_y = mask2d[:, :, :, 1:, :] * mask2d[:, :, :, :-1, :]
+        central_mask_x = mask2d[..., 1:] * mask2d[..., :-1]
+        central_mask_y = mask2d[..., 1:, :] * mask2d[..., :-1, :]
         central_mask_x = central_mask_x.reshape(B*T, C, H, W - 1)
         central_mask_y = central_mask_y.reshape(B*T, C, H - 1, W)
-        grad_x_loss = (grad_x_loss[:, :, :, :, 1:] * central_mask_x).sum() / central_mask_x.sum().clamp_min(1.0)
-        grad_y_loss = (grad_y_loss[:, :, :, 1:, :] * central_mask_y).sum() / central_mask_y.sum().clamp_min(1.0)
+        grad_x_loss = (grad_x_loss[..., 1:] * central_mask_x).sum() / central_mask_x.sum().clamp_min(1.0)
+        grad_y_loss = (grad_y_loss[..., 1:, :] * central_mask_y).sum() / central_mask_y.sum().clamp_min(1.0)
     else:
         grad_x_loss = grad_x_loss.mean()
         grad_y_loss = grad_y_loss.mean()
@@ -100,20 +101,38 @@ def compute_loss(model,x,y,mode,alpha0,alpha1,alpha2,filters,masked_loss=False,)
     if masked_loss:
         # Center 3-frame mask
         central_mask = (
-            mask2d[:, :, :, 1:-1, 1:-1]
-            * mask2d[:, :, :, :-2, 1:-1]
-            * mask2d[:, :, :, 2:, 1:-1]
-            * mask2d[:, :, :, 1:-1, :-2]
-            * mask2d[:, :, :, 1:-1, 2:]
+            mask2d[..., 1:-1, 1:-1]
+            * mask2d[..., :-2, 1:-1]
+            * mask2d[..., 2:, 1:-1]
+            * mask2d[..., 1:-1, :-2]
+            * mask2d[..., 1:-1, 2:]
         )
         central_mask = central_mask.reshape(B*T, C, H - 2, W - 2)
-        lap_loss = (lap_loss[:, :, 1:-1, 1:-1] * central_mask).sum() / central_mask.sum().clamp_min(1.0)
+        lap_loss = (lap_loss[..., 1:-1, 1:-1] * central_mask).sum() / central_mask.sum().clamp_min(1.0)
     else:
         lap_loss = lap_loss.mean()
 
     total_loss = alpha0 * mse_loss + alpha1 * grad_loss + alpha2 * lap_loss
     return total_loss
     
+
+class WandbLogger:
+    def __init__(self, log_path=None):
+        self.log_path = log_path
+        self.header_written = False
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    def log(self, data: dict):
+        if wandb.run:
+            wandb.log(data)
+        if self.log_path:
+            write_header = not os.path.exists(self.log_path) or not self.header_written
+            with open(self.log_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=data.keys())
+                if write_header:
+                    writer.writeheader()
+                    self.header_written = True
+                writer.writerow(data)
 
 def train_model(
     model,
@@ -130,12 +149,18 @@ def train_model(
     masked_loss,
     checkpoint_dir="checkpoints",
     wandb_config=None,
-    hydra_cfg=None
+    hydra_cfg=None,
+    dry_run=False,
 ):
+    import wandb  # Safe here for local + cloud hybrid logging
 
     torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.flash_sdp_enabled = True
     scaler = torch.cuda.amp.GradScaler()
+    use_amp = device.type == "cuda"
+
+    model_dtype = next(model.parameters()).dtype
+    model_device = next(model.parameters()).device
 
     os.makedirs("logs", exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -146,8 +171,9 @@ def train_model(
     best_val_loss = float("inf")
     start_epoch = 0
     global_step = 0
+    filters = None
 
-    # Try to load previous checkpoint
+    # Checkpoint loading...
     best_ckpt_path = os.path.join(checkpoint_dir, f"{model_name}_best.pt")
     if os.path.exists(best_ckpt_path):
         print(f"Found existing checkpoint. Loading: {best_ckpt_path}")
@@ -161,40 +187,35 @@ def train_model(
             best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
             start_epoch = checkpoint.get("epoch", 0) + 1
             print(f"Resuming training from epoch {start_epoch}")
+
+    # W&B Initialization
+    wandb_logger = WandbLogger(log_path=f"logs/{model_name}_wandb.csv") if wandb_config else None
+
     if wandb_config:
         wandb.init(
             project=wandb_config["project"],
             name=wandb_config.get("model_name", model_name),
-            config={
-                "lr": lr,
-                "num_epochs": num_epochs,
-                "alpha0": alpha0,
-                "alpha1": alpha1,
-                "alpha2": alpha2,
-            }
+            config={"lr": lr, "num_epochs": num_epochs, "alpha0": alpha0, "alpha1": alpha1, "alpha2": alpha2}
         )
         wandb.run.log_code(".")
         if hydra_cfg:
             wandb.config.update(OmegaConf.to_container(hydra_cfg, resolve=True), allow_val_change=True)
 
-    # Get output tensor shape
-    x, y = next(iter(train_loader))
-    C = y.shape[-3]
-    filters = GradientFilters(C).to(device)
-    
+    # Example dry-run logging (optional)
     log_path = f"logs/{model_name}_log.csv"
     if not os.path.exists(log_path):
         with open(log_path, 'w', newline='') as f:
             csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "epoch_time_sec"])
 
+    # Profiler warmup...
     ################################################################
     # Profiler
-    if hydra_cfg.training.get("enable_profiler", False):
+    if hydra_cfg.training.get("enable_profiler", True):
         print("Running dry-run for profiling...")
         x, y = next(iter(train_loader))
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        filters = GradientFilters(y.shape[-3]).to(device)
-    
+        x, y = x.to(device, non_blocking=True, dtype=torch.float32), y.to(device, non_blocking=True, dtype=torch.float32)
+        C = y.shape[-3]
+        filters = GradientFilters(C, device=model_device, dtype=model_dtype)
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
@@ -203,43 +224,46 @@ def train_model(
             on_trace_ready=torch.profiler.tensorboard_trace_handler("profiler_logs/dryrun")
         ) as prof:
             for _ in range(5):  # small warmup loop
-                with autocast(), record_function("warmup_step"):
+                with autocast(enabled=use_amp), record_function("warmup_step"):
                     loss = compute_loss(model, x, y, 'train', alpha0, alpha1, alpha2, filters, masked_loss)
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 prof.step()
     print(f"Dry-run complete. GPU mem: {torch.cuda.memory_reserved(device)/1e9:.2f} GB")
+    if dry_run:
+        return model
     ################################################################
-    
-    for epoch in range(num_epochs):
+
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         train_losses = []
         start_time = time.time()
         for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1} Training", leave=False)):
             x, y = batch[0].to(device, non_blocking=True), batch[1].to(device, non_blocking=True)
-            # Failsafe for changing channels on input..
+            if not filters:
+                C = y.shape[-3]
+                filters = GradientFilters(C, device=model_device, dtype=model_dtype)
             if filters.channels != y.shape[-3]:
-                filters = GradientFilters(y.shape[-3]).to(device)
-            optimizer.zero_grad()
-            # Profile the first 10 steps
-            with autocast():
+                C = y.shape[-3]
+                filters = GradientFilters(C, device=model_device, dtype=model_dtype)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=use_amp):
                 loss = compute_loss(model, x, y, 'train', alpha0, alpha1, alpha2, filters, masked_loss)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             train_losses.append(loss.item())
-            if wandb_config:
-                wandb.log({
-                    "train/step_loss": loss.item(),
-                    "gpu_mem_allocated": torch.cuda.memory_allocated(device) / (1024**3),
-                    "global_step": global_step
-                })
+            log_data = {
+                "train/step_loss": loss.item(),
+                "gpu_mem_allocated": torch.cuda.memory_allocated(device) / (1024**3),
+                "global_step": global_step
+            }
+            if wandb_logger:
+                wandb_logger.log(log_data)
             global_step += 1
         train_loss = np.mean(train_losses)
-        
-        # Validation
+
+        # Validation...
         val_losses = []
         model.eval()
         with torch.no_grad():
@@ -256,23 +280,22 @@ def train_model(
         if not np.isfinite(val_loss):
             print("Skipping save due to non-finite val_loss.")
             continue
-        # Save best model after every batch
+        # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), os.path.join(checkpoint_dir, f"{model_name}_best.pt"))
             print(f"Best model updated @ step {global_step} (Val Loss: {best_val_loss:.4f})")
-        # Save checkpoint every epoch
-        checkpoint_data = {
+        # Save checkpoint
+        ckpt_filename = f"{model_name}_checkpoint_{epoch+1}.pt"
+        torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_loss": best_val_loss,
-        }
-        ckpt_filename = f"{model_name}_checkpoint_{epoch+1}.pt"
-        torch.save(checkpoint_data, os.path.join(checkpoint_dir, ckpt_filename))
-        if wandb_config:
-            wandb.log({
+        }, os.path.join(checkpoint_dir, ckpt_filename))
+        if wandb_logger:
+            wandb_logger.log({
                 "epoch": epoch + 1,
                 "train/epoch_loss": train_loss,
                 "val/epoch_loss": val_loss,
@@ -288,11 +311,12 @@ def train_model(
             test_losses.append(test_loss.item())
     test_loss = np.mean(test_losses)
     print(f"Test Loss: {test_loss:.4f}")
-    if wandb_config:
-        wandb.log({"test_loss": test_loss})
+    if wandb_logger:
+        wandb_logger.log({"test_loss": test_loss})
         wandb.finish()
 
     return model
+
 
 # Main entry point
 @main(config_path="conf", config_name="config")
@@ -346,15 +370,15 @@ def run(cfg):
     # Instatiate data loaders
     def worker_init_fn(worker_id):
         _ = torch.utils.data.get_worker_info()
-    train_loader = DataLoader(train_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",False), pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",False), pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=cfg.data.batch_size, shuffle=False, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",False), pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",True), pin_memory=True, prefetch_factor=4)
+    val_loader = DataLoader(val_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",True), pin_memory=True, prefetch_factor=4)
+    test_loader = DataLoader(test_set, batch_size=cfg.data.batch_size, shuffle=False, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",True), pin_memory=True, prefetch_factor=4)
     
     # Instantiate model
     in_shape = (cfg.model.Number_timesteps, len(cfg.data.infields), 128, 128)
     base_model = simvip_model.SimVP_Model_no_skip_sst(in_shape=in_shape, **cfg.model)
+    base_model = base_model.to(device, non_blocking=True).to(torch.float32) # Put model on GPU
     base_model = torch.compile(base_model, mode="default")
-    base_model = base_model.to(device, non_blocking=True) # Put model on GPU
     print("Model is on device:", next(base_model.parameters()).device) # Verify
     
     # Train model

@@ -55,7 +55,7 @@ training:
   num_epochs: 100
   checkpoint_dir: "checkpoints"
   workers: 8
-  enable_profiler: False
+  enable_profiler: True
 
 wandb:
   model_name: ${hydra.job.name}_${now:%Y-%m-%d}-${now:%H-%M-%S}
