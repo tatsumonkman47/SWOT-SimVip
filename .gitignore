@@ -5,3 +5,4 @@ checkpoints/
 SWOT-inpainting-DL/
 .ipynb_checkpoints/
 SWOT-inpainting-DL/
+profiler_logs/

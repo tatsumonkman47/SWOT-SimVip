@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 #from torchinfo import summary
 from torch.utils.data import DataLoader, random_split, ConcatDataset
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 from torch.cuda.amp import autocast
 import numpy as np
 import time
@@ -28,7 +28,7 @@ if os.path.exists('/home.ufs/tm3076/swot_SUM03/SWOT_project/SWOT-inpainting-DL/s
 else:
     sys.path.append('/home/tm3076/projects/NYU_SWOT_project/Inpainting_Pytorch_gen/SWOT-inpainting-DL/src')
 import simvip_model
-import data_loaders 
+import chatgpt_data_loaders 
 
 # Precompute filters once (Sobel + Laplacian)
 class GradientFilters(nn.Module):
@@ -211,30 +211,47 @@ def train_model(
     ################################################################
     # Profiler
     if hydra_cfg.training.get("enable_profiler", True):
-        print("Running dry-run for profiling...")
-        x, y = next(iter(train_loader))
-        x, y = x.to(device, non_blocking=True, dtype=torch.float32), y.to(device, non_blocking=True, dtype=torch.float32)
-        C = y.shape[-3]
-        filters = GradientFilters(C, device=model_device, dtype=model_dtype)
+        prof_schedule = schedule(
+            wait=1,  # warm-up
+            warmup=1,
+            active=3,  # active profiling
+            repeat=1
+        )
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=prof_schedule,
             record_shapes=True,
-            with_stack=True,
             profile_memory=True,
-            on_trace_ready=torch.profiler.tensorboard_trace_handler("profiler_logs/dryrun")
+            with_stack=False,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("profiler_logs/detailed")
         ) as prof:
-            for _ in range(5):  # small warmup loop
-                with autocast(enabled=use_amp), record_function("warmup_step"):
+            for _ in range(5):
+                print("Running detailed dry-run for profiling...")
+                torch.cuda.synchronize()
+                start = time.time()
+                x, y = next(iter(train_loader))
+                x, y = x.to(device, non_blocking=True, dtype=torch.float32), y.to(device, non_blocking=True, dtype=torch.float32)
+                C = y.shape[-3]
+                filters = GradientFilters(C, device=model_device, dtype=model_dtype)
+                torch.cuda.synchronize()
+                print("Dataloader time:", time.time() - start)
+                start = time.time()
+                with autocast(enabled=use_amp), record_function("training_step"):
                     loss = compute_loss(model, x, y, 'train', alpha0, alpha1, alpha2, filters, masked_loss)
                 scaler.scale(loss).backward()
                 optimizer.zero_grad(set_to_none=True)
+                torch.cuda.synchronize()
+                print("GPU time:", time.time() - start)
                 prof.step()
-    print(f"Dry-run complete. GPU mem: {torch.cuda.memory_reserved(device)/1e9:.2f} GB")
+        # Print top time-consuming operations to console
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=15))
+        print(f"Dry-run complete. GPU mem: {torch.cuda.memory_reserved(device)/1e9:.2f} GB")
     if dry_run:
         return model
     ################################################################
 
     for epoch in range(start_epoch, num_epochs):
+        # Inside training loop
         model.train()
         train_losses = []
         start_time = time.time()
@@ -352,7 +369,7 @@ def run(cfg):
         print(f"Wrong datatype detected in {cfg.data.patch_coords_file}, expected one of [.npy, .zarr, .nc]")
     # Load dataset
     full_dataset = ConcatDataset([
-        data_loaders.llc4320_dataset(
+        chatgpt_data_loaders.llc4320_dataset(
             cfg.data.dataset_path, t, cfg.data.N_t, patch_coords,
             cfg.data.infields, cfg.data.outfields, cfg.data.in_mask_list, cfg.data.out_mask_list,
             cfg.data.in_transform_list, cfg.data.out_transform_list, standards=standards,
@@ -370,9 +387,24 @@ def run(cfg):
     # Instatiate data loaders
     def worker_init_fn(worker_id):
         _ = torch.utils.data.get_worker_info()
-    train_loader = DataLoader(train_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",True), pin_memory=True, prefetch_factor=4)
-    val_loader = DataLoader(val_set, batch_size=cfg.data.batch_size, shuffle=True, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",True), pin_memory=True, prefetch_factor=4)
-    test_loader = DataLoader(test_set, batch_size=cfg.data.batch_size, shuffle=False, num_workers=cfg.training.get("workers",8), worker_init_fn=worker_init_fn, persistent_workers=cfg.training.get("persistent_workers",True), pin_memory=True, prefetch_factor=4)
+
+    def worker_init_fn(worker_id):
+    np.random.seed(torch.initial_seed() % (2**32))
+    #worker_info = torch.utils.data.get_worker_info()
+
+
+    data_loader_kwargs = {"shuffle":True,
+                          "batch_size":batch_size=cfg.data.batch_size,
+                          "num_workers":cfg.training.get("workers",8),
+                          "worker_init_fn":worker_init_fn,
+                          "persistent_workers":cfg.training.get("persistent_workers",True),#multiprocessing,
+                          "pin_memory":True,
+                          "prefetch_factor":4,
+                         #"multiprocessing_context":'spawn'
+                         }
+    train_loader = DataLoader(train_set,**data_loader_kwargs)
+    val_loader = DataLoader(val_set, **data_loader_kwargs)
+    test_loader = DataLoader(test_set, **data_loader_kwargs)
     
     # Instantiate model
     in_shape = (cfg.model.Number_timesteps, len(cfg.data.infields), 128, 128)
@@ -396,7 +428,8 @@ def run(cfg):
         alpha2=cfg.model.alpha2,
         masked_loss=cfg.model.masked_loss,
         wandb_config=cfg.wandb,
-        hydra_cfg=cfg  # Log the entire config to wandb
+        hydra_cfg=cfg,  # Log the entire config to wandb
+        dry_run=cfg.training.dry_run,
     )
     
 if __name__ == "__main__":

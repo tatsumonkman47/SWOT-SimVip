@@ -35,7 +35,7 @@ data:
   std_sst: 5.987649544923141
   N_t: 10
   timesteps_range: [20, 360, 2] # [start, stop, step]
-  batch_size: 64
+  batch_size: 30
   return_masks: False
   cloud_rho: 0.5
 
@@ -44,7 +44,7 @@ model:
   alpha0: 1
   alpha1: 10
   alpha2: 10
-  lr: 1e-6
+  lr: 1e-5
   drop: 0.2
   drop_path: 0.15
   model_type: "gSTA"
@@ -56,7 +56,8 @@ training:
   checkpoint_dir: "checkpoints"
   workers: 8
   enable_profiler: True
-
+  dry_run: False
+  
 wandb:
   model_name: ${hydra.job.name}_${now:%Y-%m-%d}-${now:%H-%M-%S}
   project: "SimVip_video_inpainting"
