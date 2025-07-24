@@ -1,4 +1,4 @@
-model_variant: 0X2_C1_10rho_alpha20_test
+model_variant: C2_003_10rho
 
 wandb:
   project: "SimVip_video_inpainting"
@@ -6,14 +6,11 @@ wandb:
 
 defaults:
   - 000_base_config_Greene
-  
+
 data:
   patch_coords_file: "zarred_UVSST_x_y_coordinates_noland_nonan.npy"
   infields: ["zarr_llc4320_SSH_tiles_4km_filtered", "zarr_llc4320_SST_tiles_4km"]
   outfields: ["zarr_llc4320_SSH_tiles_4km_filtered"]
   in_mask_list: ["nadir", "None"]
-  out_mask_list: ["None"]
+  out_mask_list: ["swot_central"]
 
-model:
-  alpha1: 20
-  alpha2: 20

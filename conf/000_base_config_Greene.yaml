@@ -27,12 +27,13 @@ data:
   outfields: ["zarr_llc4320_SSH_tiles_4km_filtered"]
   in_mask_list: ["nadir", "cloud_rho"]
   out_mask_list: ["swot_central"]
-  in_transform_list: ["std_global_mean_ssh_norm", "std_global_mean_sst_norm"]
+  in_transform_list: ["std_global_mean_ssh_norm", "std_seasonal_mean_sst_norm"]
   out_transform_list: ["std_global_mean_ssh_norm"]
   mean_ssh: 0
   std_ssh: 0.0453692672359483
   mean_sst: 15.956900367755182
-  std_sst: 5.987649544923141
+  extra_mean_tuning: 1.5
+  std_sst: 5.5
   N_t: 10
   timesteps_range: [20, 360, 2] # [start, stop, step]
   batch_size: 30

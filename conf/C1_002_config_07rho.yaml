@@ -1,4 +1,4 @@
-model_variant: 012_C1_config_07rho
+model_variant: C1_002_config_07rho
 
 wandb:
   project: "SimVip_video_inpainting"

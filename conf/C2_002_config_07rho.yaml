@@ -1,4 +1,4 @@
-model_variant: 025_C3_config_00rho
+model_variant: C2_002_config_07rho
 
 wandb:
   project: "SimVip_video_inpainting"
@@ -11,6 +11,7 @@ data:
   patch_coords_file: "zarred_UVSST_x_y_coordinates_noland_nonan.npy"
   infields: ["zarr_llc4320_SSH_tiles_4km_filtered", "zarr_llc4320_SST_tiles_4km"]
   outfields: ["zarr_llc4320_SSH_tiles_4km_filtered"]
-  in_mask_list: ["swot_calval_nadir", "cloud_rho"]
-  out_mask_list: ["None"]
-  cloud_rho: 0.0
+  in_mask_list: ["nadir", "cloud_rho"]
+  out_mask_list: ["swot_central"]
+  cloud_rho: 0.7
+

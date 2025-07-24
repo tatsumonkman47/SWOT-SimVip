@@ -1,4 +1,4 @@
-model_variant: 024_C3_config_02rho
+model_variant: C3_001_config_05rho
 
 wandb:
   project: "SimVip_video_inpainting"
@@ -7,11 +7,11 @@ wandb:
 defaults:
   - 000_base_config_Greene
 
-
 data:
   patch_coords_file: "zarred_UVSST_x_y_coordinates_noland_nonan.npy"
   infields: ["zarr_llc4320_SSH_tiles_4km_filtered", "zarr_llc4320_SST_tiles_4km"]
   outfields: ["zarr_llc4320_SSH_tiles_4km_filtered"]
   in_mask_list: ["swot_calval_nadir", "cloud_rho"]
   out_mask_list: ["None"]
-  cloud_rho: 0.2
+  cloud_rho: 0.5
+

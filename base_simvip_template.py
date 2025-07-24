@@ -158,13 +158,10 @@ def train_model(
     torch.backends.cuda.flash_sdp_enabled = True
     scaler = torch.cuda.amp.GradScaler()
     use_amp = device.type == "cuda"
-
     model_dtype = next(model.parameters()).dtype
     model_device = next(model.parameters()).device
-
     os.makedirs("logs", exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
@@ -207,45 +204,56 @@ def train_model(
         with open(log_path, 'w', newline='') as f:
             csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "epoch_time_sec"])
 
-    # Profiler warmup...
     ################################################################
-    # Profiler
+    # Profiler warmup...
     if hydra_cfg.training.get("enable_profiler", True):
+        has_cuda = torch.cuda.is_available() and device.type == "cuda"
         prof_schedule = schedule(
-            wait=1,  # warm-up
+            wait=1,    # warm-up
             warmup=1,
             active=3,  # active profiling
             repeat=1
         )
+        activities = [ProfilerActivity.CPU]
+        if has_cuda:
+            activities.append(ProfilerActivity.CUDA)
         with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=activities,
             schedule=prof_schedule,
-            record_shapes=True,
-            profile_memory=True,
+            record_shapes=False,
+            profile_memory=False,
             with_stack=False,
             on_trace_ready=torch.profiler.tensorboard_trace_handler("profiler_logs/detailed")
         ) as prof:
             for _ in range(5):
                 print("Running detailed dry-run for profiling...")
-                torch.cuda.synchronize()
+                if has_cuda:
+                    torch.cuda.synchronize()
                 start = time.time()
                 x, y = next(iter(train_loader))
-                x, y = x.to(device, non_blocking=True, dtype=torch.float32), y.to(device, non_blocking=True, dtype=torch.float32)
+                x = x.to(device, non_blocking=has_cuda, dtype=torch.float32)
+                y = y.to(device, non_blocking=has_cuda, dtype=torch.float32)
                 C = y.shape[-3]
                 filters = GradientFilters(C, device=model_device, dtype=model_dtype)
-                torch.cuda.synchronize()
+                if has_cuda:
+                    torch.cuda.synchronize()
                 print("Dataloader time:", time.time() - start)
                 start = time.time()
                 with autocast(enabled=use_amp), record_function("training_step"):
                     loss = compute_loss(model, x, y, 'train', alpha0, alpha1, alpha2, filters, masked_loss)
                 scaler.scale(loss).backward()
                 optimizer.zero_grad(set_to_none=True)
-                torch.cuda.synchronize()
-                print("GPU time:", time.time() - start)
+                if has_cuda:
+                    torch.cuda.synchronize()
+                print("GPU time:" if has_cuda else "CPU time:", time.time() - start)
                 prof.step()
-        # Print top time-consuming operations to console
-        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=15))
-        print(f"Dry-run complete. GPU mem: {torch.cuda.memory_reserved(device)/1e9:.2f} GB")
+        # Print summary
+        print(prof.key_averages().table(
+            sort_by="self_cuda_time_total" if has_cuda else "self_cpu_time_total",
+            row_limit=15
+        ))
+        if has_cuda:
+            print(f"Dry-run complete. GPU mem: {torch.cuda.memory_reserved(device)/1e9:.2f} GB")
     if dry_run:
         return model
     ################################################################
@@ -389,12 +397,12 @@ def run(cfg):
         _ = torch.utils.data.get_worker_info()
 
     def worker_init_fn(worker_id):
-    np.random.seed(torch.initial_seed() % (2**32))
-    #worker_info = torch.utils.data.get_worker_info()
+        np.random.seed(torch.initial_seed() % (2**32))
+        worker_info = torch.utils.data.get_worker_info()
 
 
     data_loader_kwargs = {"shuffle":True,
-                          "batch_size":batch_size=cfg.data.batch_size,
+                          "batch_size":batch_size,#cfg.data.get("batch_size",batch_size),
                           "num_workers":cfg.training.get("workers",8),
                           "worker_init_fn":worker_init_fn,
                           "persistent_workers":cfg.training.get("persistent_workers",True),#multiprocessing,
